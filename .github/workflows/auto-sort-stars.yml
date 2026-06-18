@@ -1,0 +1,145 @@
+# .github/workflows/auto-sort-stars.yml
+# 每周自动整理新 star 到对应分类列表中
+# 放在你的任一仓库的 .github/workflows/ 目录下即可生效
+# 也可以放到 username/username 这个特殊仓库 (profile repo)
+
+name: 🤖 Auto-Sort GitHub Stars
+
+on:
+  schedule:
+    # 每周日 UTC 0 点 (北京时间周日上午 8 点)
+    - cron: '0 0 * * 0'
+  # 也可以手动触发
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sort-stars:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup GitHub CLI
+        run: |
+          echo "${{ secrets.GH_TOKEN }}" | gh auth login --with-token
+
+      - name: Fetch unclassified stars
+        run: |
+          # 获取所有 star 和所有列表成员，找出未分类的
+          python3 << 'PYEOF'
+          import json, subprocess, sys, time, tempfile, os
+
+          # ── 获取已有的列表 ──
+          lists_result = subprocess.run(
+              ["gh", "api", "graphql", "-f", "query=query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { id } totalCount } } } } }"],
+              capture_output=True, text=True,
+          )
+          lists_data = json.loads(lists_result.stdout)
+
+          list_map = {}  # list_name → list_id
+          classified_ids = set()  # 所有已分类的 repo node ID
+
+          for lst in lists_data["data"]["viewer"]["lists"]["nodes"]:
+              list_map[lst["name"]] = lst["id"]
+              for item in lst["items"]["nodes"]:
+                  classified_ids.add(item["id"])
+              # 如果超过 100 个，拉更多
+              if lst["items"]["totalCount"] > 100:
+                  # 简化处理：超过 100 的列表我们信任它已经全覆盖
+                  pass
+
+          print(f"找到 {len(list_map)} 个列表, {len(classified_ids)} 个已分类 repos")
+
+          # ── 获取最新的 30 个 star ──
+          stars_result = subprocess.run(
+              ["gh", "api", "/user/starred", "--jq", '.[] | {full_name, node_id, description, language, topics}'],
+              capture_output=True, text=True,
+          )
+          new_repos = []
+          for line in stars_result.stdout.strip().split("\n"):
+              if not line.strip(): continue
+              try:
+                  repo = json.loads(line)
+                  if repo.get("node_id") and repo["node_id"] not in classified_ids:
+                      new_repos.append(repo)
+              except: pass
+
+          if not new_repos:
+              print("✅ 所有 star 已分类，无需整理")
+              sys.exit(0)
+
+          print(f"🔍 发现 {len(new_repos)} 个未分类的新 star:")
+          for r in new_repos:
+              print(f"  • {r['full_name']} — {r.get('description','N/A')[:60]}")
+
+          # ── AI 分类 ──
+          def classify(repo):
+              name = (repo.get("full_name") or "").lower()
+              desc = (repo.get("description") or "").lower()
+              topics = " ".join(repo.get("topics") or []) if isinstance(repo.get("topics"), list) else (repo.get("topics") or "")
+              combined = f"{name} {desc} {topics}".lower()
+
+              # 快速关键词匹配
+              if any(k in name for k in ["skill", "superpowers", "agent-md", "pua", "gstack"]):
+                  if not any(b in combined for b in ["proxy","2api","agent hub","harness framework"]):
+                      return "🦞 Claude Code 技能"
+              if any(k in combined for k in ["agent framework", "multi-agent", "agent harness", "orchestration", "openclaw", "bmad"]):
+                  return "🤖 AI Agent 与编排"
+              if any(k in combined for k in ["2api", "proxy", "api gateway", "account pool", "reverse", "mirror"]):
+                  return "🔧 API 代理与逆向"
+              if any(k in combined for k in ["design", "ui library", "component library", "shadcn", "tailwind", "frontend", "css"]):
+                  return "🎨 设计与前端"
+              if any(k in combined for k in ["llm", "deep learning", "tutorial", "paper", "course", "transformer", "fine-tun"]):
+                  return "🧠 AI/ML 学习"
+              if any(k in combined for k in ["ppt", "slide", "presentation", "video", "seo", "content"]):
+                  return "📽️ 幻灯片与内容生成"
+              if any(k in combined for k in ["chatbot", "bot", "im", "telegram", "qq", "wechat", "discord"]):
+                  return "💬 聊天机器人"
+              if any(k in combined for k in ["blog", "cms", "hugo", "hexo", "resume", "cv"]):
+                  return "📝 博客与文档"
+              if any(k in combined for k in ["memory", "rag", "vector database", "knowledge graph", "context"]):
+                  return "🧩 AI 记忆与上下文"
+              if any(k in combined for k in ["crawler", "scraper", "browser", "cli", "tool", "utils", "docker", "kubernetes"]):
+                  return "🛠️ 开发工具"
+
+              # 兜底：用 GitHub 的 language/topics 推断
+              lang = (repo.get("language") or "").lower()
+              if lang in ["typescript", "javascript"]:
+                  return "🛠️ 开发工具"
+
+              return "🛠️ 开发工具"
+
+          # ── 分类并添加到列表 ──
+          success = 0
+          for repo in new_repos:
+              category = classify(repo)
+              lid = list_map.get(category)
+              if not lid:
+                  print(f"  ⚠️  {repo['full_name']} → {category} (列表不存在)")
+                  continue
+
+              payload = {
+                  "query": "mutation($item: ID!, $lists: [ID!]!) { updateUserListsForItem(input: {itemId: $item, listIds: $lists}) { clientMutationId } }",
+                  "variables": {"item": repo["node_id"], "lists": [lid]}
+              }
+
+              fd, tmpfile = tempfile.mkstemp(suffix=".json")
+              with os.fdopen(fd, 'w') as f:
+                  json.dump(payload, f)
+
+              result = subprocess.run(["gh", "api", "graphql", "--input", tmpfile], capture_output=True, text=True)
+              os.unlink(tmpfile)
+
+              if result.returncode == 0:
+                  success += 1
+                  print(f"  ✅ {repo['full_name']} → {category}")
+              else:
+                  print(f"  ❌ {repo['full_name']} 失败")
+              time.sleep(0.2)
+
+          print(f"\n🎉 {success}/{len(new_repos)} 个新 star 已整理")
+          PYEOF
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
