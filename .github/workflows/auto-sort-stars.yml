@@ -10,7 +10,7 @@ on:
 jobs:
   sort-stars:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Sort unclassified stars
@@ -77,37 +77,53 @@ jobs:
               page += 1
               time.sleep(0.5)
 
-          # Need node_id from GraphQL
+          # Need node_id + README from GraphQL
           if starred:
-              # Build bulk GraphQL query for node IDs of unclassified only
               names = [r["full_name"] for r in starred]
               aliases = []
               for i, fn in enumerate(names):
                   owner, name = fn.split("/")
-                  aliases.append(f'r{i}: repository(owner: "{owner}", name: "{name}") {{ id }}')
+                  aliases.append(
+                      f'r{i}: repository(owner: "{owner}", name: "{name}") {{'
+                      f'  id description primaryLanguage {{ name }}'
+                      f'  repositoryTopics(first: 10) {{ nodes {{ topic {{ name }} }} }}'
+                      f'  object(expression: "HEAD:README.md") {{ ... on Blob {{ text }} }}'
+                      f'}}'
+                  )
 
-              node_ids = {}
-              for bs in range(0, len(aliases), 50):
-                  batch_query = "query {\n" + "\n".join(aliases[bs:bs+50]) + "\n}"
+              enriched = {}
+              for bs in range(0, len(aliases), 20):
+                  batch_query = "query {\n" + "\n".join(aliases[bs:bs+20]) + "\n}"
                   data = gql(batch_query)
                   if "data" in data:
-                      for j in range(bs, min(bs+50, len(names))):
-                          node_id = data["data"].get(f"r{j}", {}).get("id")
-                          if node_id:
-                              node_ids[names[j]] = node_id
-                  time.sleep(0.3)
+                      for j in range(bs, min(bs+20, len(names))):
+                          enriched[names[j]] = data["data"].get(f"r{j}")
+                  time.sleep(0.5)
 
               new_repos = []
               for r in starred:
                   fn = r["full_name"]
-                  nid = node_ids.get(fn)
-                  if nid and nid not in classified_ids:
-                      new_repos.append({
-                          "full_name": fn,
-                          "node_id": nid,
-                          "description": r.get("description", ""),
-                          "language": r.get("language", ""),
-                      })
+                  info = enriched.get(fn)
+                  if not info or not info.get("id"):
+                      continue
+                  nid = info["id"]
+                  if nid in classified_ids:
+                      continue
+
+                  desc = info.get("description") or r.get("description", "")
+                  lang = (info.get("primaryLanguage") or {}).get("name", "") or r.get("language", "")
+                  topics = [t["topic"]["name"] for t in ((info.get("repositoryTopics") or {}).get("nodes") or [])]
+                  readme_obj = info.get("object") or {}
+                  readme = (readme_obj.get("text") or "")[:500]
+
+                  new_repos.append({
+                      "full_name": fn,
+                      "node_id": nid,
+                      "description": desc,
+                      "language": lang,
+                      "topics": topics,
+                      "readme": readme,
+                  })
           else:
               new_repos = []
 
@@ -119,32 +135,106 @@ jobs:
           for r in new_repos:
               print(f"  • {r['full_name']}")
 
-          # ── 分类 ──
+          # ── 分类（基于 README + 描述 + 话题）──
           def classify(repo):
               name = (repo.get("full_name") or "").lower()
               desc = (repo.get("description") or "").lower()
               lang = (repo.get("language") or "").lower()
-              combined = f"{name} {desc} {lang}"
+              topics_str = " ".join(repo.get("topics") or []).lower()
+              readme = (repo.get("readme") or "").lower()
+              combined = f"{name} {desc} {lang} {topics_str} {readme[:500]}"
 
-              if any(k in name for k in ["skill", "superpowers", "agent-md", "pua", "gstack"]):
-                  if not any(b in combined for b in ["proxy","2api","agent hub","harness framework"]):
+              # ========== Claude Code 技能 ==========
+              # Strong signals: skill name patterns, agent-format skill repos
+              if any(k in name for k in ["-skill", "skill-", "skills", "superpowers", "agent-md", "pua", "gstack"]):
+                  if not any(b in combined for b in ["proxy", "2api", "agent hub", "harness framework", "orchestrat"]):
                       return "🦞 Claude Code 技能"
-              if any(k in combined for k in ["agent framework", "multi-agent", "agent harness", "orchestration", "openclaw", "bmad"]):
+              if any(k in combined for k in ["claude code skill", "codex skill", "agent skill", "ai agent skill",
+                                              "agent skills framework", "claude code plugin", "skill for claude"]):
+                  return "🦞 Claude Code 技能"
+              if any(k in combined for k in ["claude code", "codex cli", "coding agent"]) and "skill" in combined:
+                  return "🦞 Claude Code 技能"
+
+              # ========== AI Agent 与编排 ==========
+              if any(k in combined for k in ["agent framework", "multi-agent", "agent harness", "agent orchestration",
+                                              "openclaw", "hermes agent", "coding agents", "bmad method",
+                                              "coordinate your coding agents", "army of claude", "agent hub",
+                                              "personal ai assistant", "multiple agents", "parallel flow"]):
                   return "🤖 AI Agent 与编排"
-              if any(k in combined for k in ["2api", "proxy", "api gateway", "account pool", "reverse", "mirror"]):
+              if any(k in name for k in ["lambchat", "oh-my-openagent", "ensoai"]):
+                  return "🤖 AI Agent 与编排"
+
+              # ========== API 代理与逆向 ==========
+              if any(k in combined for k in ["2api", "api proxy", "api gateway", "account pool", "账号池",
+                                              "openai 兼容", "anthropic 兼容", "openai format",
+                                              "subscription", "grok mirror", "cc-switch", "cc-helper",
+                                              "account manager", "quota", "byok", "buildid", "nexos2api",
+                                              "relay", "pool proxy", "号池", "多账号"]):
                   return "🔧 API 代理与逆向"
-              if any(k in combined for k in ["design", "ui library", "component library", "shadcn", "tailwind", "frontend", "css"]):
+              if any(k in name for k in ["cockpit-tools", "windsurfpoolapi", "windsurf-manager", "chatgpt2api",
+                                         "freebuff2api", "flow2api", "ccometixline", "all-api-hub", "sub2api",
+                                         "cliproxyapi"]):
+                  return "🔧 API 代理与逆向"
+
+              # ========== 设计与前端 ==========
+              if any(k in combined for k in ["design system", "ui library", "component library", "shadcn",
+                                              "tailwind css", "ui kit", "design language", "design tool",
+                                              "open design", "awesome-design", "design engineering",
+                                              "component kit", "react ui", "design.md"]):
                   return "🎨 设计与前端"
-              if any(k in combined for k in ["llm", "deep learning", "tutorial", "paper", "course", "transformer", "fine-tun"]):
+              if any(k in name for k in ["heroui", "cult-ui", "animal-island", "liquid-glass", "shadcn-admin",
+                                         "markdownview", "tegaki", "blossom", "marknative", "kami"]):
+                  return "🎨 设计与前端"
+
+              # ========== AI/ML 学习 ==========
+              if any(k in combined for k in ["deep learning", "llm tutorial", "paper implement", "transformer",
+                                              "fine-tun", "llm 教程", "大模型", "vibe coding",
+                                              "nano gpt", "timesfm", "cookbook", "insightface",
+                                              "ai engineering interview", "tts model", "speech model",
+                                              "text-to-speech", "语音合成", "fish speech"]):
                   return "🧠 AI/ML 学习"
-              if any(k in combined for k in ["ppt", "slide", "presentation", "video", "seo", "content"]):
+              if any(k in name for k in ["build-nanogpt", "self-llm", "happy-llm", "misotts", "fish-speech",
+                                         "annotated_deep_learning", "msa"]):
+                  return "🧠 AI/ML 学习"
+
+              # ========== 幻灯片与内容生成 ==========
+              if any(k in combined for k in ["ppt", "slide deck", "presentation", "powerpoint", "视频",
+                                              "manim", "remotion", "seo skill", "geo content",
+                                              "content automation", "google ads", "meta ads"]):
                   return "📽️ 幻灯片与内容生成"
-              if any(k in combined for k in ["chatbot", "bot", "im", "telegram", "qq", "wechat", "discord"]):
+              if any(k in name for k in ["ppt-master", "starry-slides", "guizang-ppt", "geopflow",
+                                         "manimcat", "frontend-slides", "gordenppt", "notfair"]):
+                  return "📽️ 幻灯片与内容生成"
+
+              # ========== 聊天机器人 ==========
+              if any(k in combined for k in ["chatbot", "im platform", "qq bot", "telegram bot", "discord bot",
+                                              "companion", "情感陪伴", "ai twin", "digital avatar",
+                                              "opinion analysis", "舆情"]):
                   return "💬 聊天机器人"
-              if any(k in combined for k in ["blog", "cms", "hugo", "hexo", "resume", "cv"]):
+              if any(k in name for k in ["astrbot", "rikkahub", "kourichat", "weclone", "bettafish"]):
+                  return "💬 聊天机器人"
+
+              # ========== 博客与文档 ==========
+              if any(k in combined for k in ["blog framework", "static site", "hugo", "hexo",
+                                              "resume builder", "cv template", "树莓派文档",
+                                              "material design blog", "note sync", "obsidian"]):
                   return "📝 博客与文档"
-              if any(k in combined for k in ["memory", "rag", "vector database", "knowledge graph", "context"]):
+              if any(k in name for k in ["yamlresume", "magic-resume", "pidoc-site", "2025-blog", "mizuki",
+                                         "obsidian-fast-note"]):
+                  return "📝 博客与文档"
+
+              # ========== AI 记忆与上下文 ==========
+              if any(k in combined for k in ["memory layer", "context database", "context engineering",
+                                              "vector database", "knowledge graph", "rag",
+                                              "long-term memory", "memory os", "memory palace",
+                                              "harness performance"]):
                   return "🧩 AI 记忆与上下文"
+              if any(k in name for k in ["cloudmind", "openviking", "zvec", "engram", "memory-palace"]):
+                  return "🧩 AI 记忆与上下文"
+
+              # ========== 兜底 ==========
+              if lang in ["typescript", "javascript", "go", "rust", "python", "shell"]:
+                  return "🛠️ 开发工具"
               return "🛠️ 开发工具"
 
           # ── 添加到列表 ──
