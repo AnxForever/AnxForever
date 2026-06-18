@@ -44,7 +44,7 @@ jobs:
 
           # ── 获取列表 ──
           print("📋 获取列表...")
-          lists_data = gql("query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { id } } } } } }")
+          lists_data = gql("query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { ... on Repository { id } } } } } } }")
           if "error" in lists_data or "data" not in lists_data:
               print(f"❌ 获取列表失败")
               sys.exit(1)
