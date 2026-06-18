@@ -30,7 +30,11 @@ jobs:
               ["gh", "api", "graphql", "-f", "query=query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { id } } } } } }"],
               capture_output=True, text=True,
           )
-          lists_data = json.loads(lists_result.stdout)
+          try:
+              lists_data = json.loads(lists_result.stdout)
+          except json.JSONDecodeError:
+              print(f"❌ 列表查询失败:\nstdout: {lists_result.stdout[:500]}\nstderr: {lists_result.stderr[:500]}")
+              sys.exit(1)
 
           list_map = {}
           classified_ids = set()
@@ -58,7 +62,15 @@ jobs:
               ["gh", "api", "graphql", "-f", f"query={stars_gql}", "-f", "after="],
               capture_output=True, text=True,
           )
-          stars_data = json.loads(stars_result.stdout)
+          try:
+              stars_data = json.loads(stars_result.stdout)
+          except json.JSONDecodeError:
+              print(f"❌ Star 查询失败:\nstdout: {stars_result.stdout[:500]}\nstderr: {stars_result.stderr[:500]}")
+              sys.exit(1)
+
+          if "data" not in stars_data:
+              print(f"❌ API 返回异常: {json.dumps(stars_data)[:500]}")
+              sys.exit(1)
           starred = stars_data["data"]["viewer"]["starredRepositories"]["nodes"]
 
           new_repos = []
