@@ -1,90 +1,115 @@
-# .github/workflows/auto-sort-stars.yml
 # 每周自动整理新 star 到对应分类列表中
 
 name: 🤖 Auto-Sort GitHub Stars
 
 on:
   schedule:
-    # 每周日 UTC 0 点 (北京时间周日上午 8 点)
     - cron: '0 0 * * 0'
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   sort-stars:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
-      - name: Fetch unclassified stars and sort
+      - name: Sort unclassified stars
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_PAT: ${{ secrets.GH_TOKEN }}
         run: |
           python3 << 'PYEOF'
-          import json, subprocess, sys, time, tempfile, os
+          import json, os, sys, time, tempfile, urllib.request, urllib.error
 
-          # ── 获取已有的列表及其中的 repo ──
-          lists_result = subprocess.run(
-              ["gh", "api", "graphql", "-f", "query=query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { id } } } } } }"],
-              capture_output=True, text=True,
-          )
-          try:
-              lists_data = json.loads(lists_result.stdout)
-          except json.JSONDecodeError:
-              print(f"❌ 列表查询失败:\nstdout: {lists_result.stdout[:500]}\nstderr: {lists_result.stderr[:500]}")
-              sys.exit(1)
+          TOKEN = os.environ["GH_PAT"]
+          HEADERS = {
+              "Authorization": f"Bearer {TOKEN}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
 
-          if "data" not in lists_data:
-              print(f"❌ 列表 API 异常: {json.dumps(lists_data)[:500]}")
+          def gql(query, variables=None):
+              """Run a GraphQL query, return parsed JSON."""
+              body = json.dumps({"query": query, "variables": variables or {}}).encode()
+              req = urllib.request.Request("https://api.github.com/graphql", data=body, headers=HEADERS, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      data = json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  err_body = e.read().decode()
+                  print(f"  GraphQL HTTP {e.code}: {err_body[:300]}")
+                  return {"error": err_body}
+              if "errors" in data:
+                  print(f"  GraphQL error: {json.dumps(data['errors'])[:300]}")
+              return data
+
+          # ── 获取列表 ──
+          print("📋 获取列表...")
+          lists_data = gql("query { viewer { lists(first: 20) { nodes { id name items(first: 100) { nodes { id } } } } } }")
+          if "error" in lists_data or "data" not in lists_data:
+              print(f"❌ 获取列表失败")
               sys.exit(1)
 
           list_map = {}
           classified_ids = set()
-
           for lst in lists_data["data"]["viewer"]["lists"]["nodes"]:
               list_map[lst["name"]] = lst["id"]
               for item in lst["items"]["nodes"]:
                   classified_ids.add(item["id"])
+          print(f"   {len(list_map)} 个列表, {len(classified_ids)} 个已分类")
 
-          print(f"📋 {len(list_map)} 个列表, {len(classified_ids)} 个已分类 repo")
+          # ── 获取最新 star ──
+          print("⭐ 获取最新 star...")
+          # Use REST API for pagination
+          starred = []
+          page = 1
+          while page <= 3:
+              url = f"https://api.github.com/user/starred?per_page=100&page={page}"
+              req = urllib.request.Request(url, headers=HEADERS)
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      batch = json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  print(f"  Star API HTTP {e.code}: {e.read().decode()[:200]}")
+                  break
+              if not batch:
+                  break
+              starred.extend(batch)
+              page += 1
+              time.sleep(0.5)
 
-          # ── 获取最新 50 个 star（GraphQL，带 node_id）──
-          stars_gql = '''
-          query($after: String) {
-            viewer {
-              starredRepositories(first: 50, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
-                nodes { id nameWithOwner description primaryLanguage { name } }
-                totalCount
-                pageInfo { endCursor hasNextPage }
-              }
-            }
-          }
-          '''
-          stars_result = subprocess.run(
-              ["gh", "api", "graphql", "-f", f"query={stars_gql}", "-f", "after="],
-              capture_output=True, text=True,
-          )
-          try:
-              stars_data = json.loads(stars_result.stdout)
-          except json.JSONDecodeError:
-              print(f"❌ Star 查询失败:\nstdout: {stars_result.stdout[:500]}\nstderr: {stars_result.stderr[:500]}")
-              sys.exit(1)
+          # Need node_id from GraphQL
+          if starred:
+              # Build bulk GraphQL query for node IDs of unclassified only
+              names = [r["full_name"] for r in starred]
+              aliases = []
+              for i, fn in enumerate(names):
+                  owner, name = fn.split("/")
+                  aliases.append(f'r{i}: repository(owner: "{owner}", name: "{name}") {{ id }}')
 
-          if "data" not in stars_data:
-              print(f"❌ API 返回异常: {json.dumps(stars_data)[:500]}")
-              sys.exit(1)
-          starred = stars_data["data"]["viewer"]["starredRepositories"]["nodes"]
+              node_ids = {}
+              for bs in range(0, len(aliases), 50):
+                  batch_query = "query {\n" + "\n".join(aliases[bs:bs+50]) + "\n}"
+                  data = gql(batch_query)
+                  if "data" in data:
+                      for j in range(bs, min(bs+50, len(names))):
+                          node_id = data["data"].get(f"r{j}", {}).get("id")
+                          if node_id:
+                              node_ids[names[j]] = node_id
+                  time.sleep(0.3)
 
-          new_repos = []
-          for r in starred:
-              if r["id"] not in classified_ids:
-                  new_repos.append({
-                      "full_name": r["nameWithOwner"],
-                      "node_id": r["id"],
-                      "description": r.get("description", ""),
-                      "language": r.get("primaryLanguage", {}).get("name", "") if r.get("primaryLanguage") else "",
-                  })
+              new_repos = []
+              for r in starred:
+                  fn = r["full_name"]
+                  nid = node_ids.get(fn)
+                  if nid and nid not in classified_ids:
+                      new_repos.append({
+                          "full_name": fn,
+                          "node_id": nid,
+                          "description": r.get("description", ""),
+                          "language": r.get("language", ""),
+                      })
+          else:
+              new_repos = []
 
           if not new_repos:
               print("✅ 所有 star 已分类，无需整理")
@@ -131,23 +156,13 @@ jobs:
                   print(f"  ⚠️  {repo['full_name']} → {category} (无列表)")
                   continue
 
-              payload = {
-                  "query": "mutation($item: ID!, $lists: [ID!]!) { updateUserListsForItem(input: {itemId: $item, listIds: $lists}) { clientMutationId } }",
-                  "variables": {"item": repo["node_id"], "lists": [lid]}
-              }
-
-              fd, tmpfile = tempfile.mkstemp(suffix=".json")
-              with os.fdopen(fd, 'w') as f:
-                  json.dump(payload, f)
-
-              result = subprocess.run(["gh", "api", "graphql", "--input", tmpfile], capture_output=True, text=True)
-              os.unlink(tmpfile)
-
-              if result.returncode == 0:
+              mutation = "mutation($item: ID!, $lists: [ID!]!) { updateUserListsForItem(input: {itemId: $item, listIds: $lists}) { clientMutationId } }"
+              result = gql(mutation, {"item": repo["node_id"], "lists": [lid]})
+              if "data" in result and "errors" not in result:
                   success += 1
                   print(f"  ✅ {repo['full_name']} → {category}")
               else:
-                  print(f"  ❌ {repo['full_name']} 失败: {result.stderr[:80]}")
+                  print(f"  ❌ {repo['full_name']} 失败")
               time.sleep(0.15)
 
           print(f"\n🎉 {success}/{len(new_repos)} 已整理")
