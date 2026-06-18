@@ -16,11 +16,10 @@ jobs:
   sort-stars:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
     steps:
       - name: Fetch unclassified stars and sort
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           python3 << 'PYEOF'
           import json, subprocess, sys, time, tempfile, os
@@ -34,6 +33,10 @@ jobs:
               lists_data = json.loads(lists_result.stdout)
           except json.JSONDecodeError:
               print(f"❌ 列表查询失败:\nstdout: {lists_result.stdout[:500]}\nstderr: {lists_result.stderr[:500]}")
+              sys.exit(1)
+
+          if "data" not in lists_data:
+              print(f"❌ 列表 API 异常: {json.dumps(lists_data)[:500]}")
               sys.exit(1)
 
           list_map = {}
