@@ -1,0 +1,26 @@
+# GitHub 会在仓库 60 天无活动后自动禁用定时 workflow(auto-sort 因此被禁过一次)。
+# 每月 1 日推一个空提交保活,顺带把 auto-sort 手动触发一次。
+name: 🫀 Keepalive
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Empty commit to keep the repo active
+        run: |
+          git config user.name "AnxForever"
+          git config user.email "130662349+AnxForever@users.noreply.github.com"
+          git commit --allow-empty -m "🫀 keepalive: 保持仓库活跃,防止定时 workflow 被自动禁用"
+          git push
+      - name: Trigger auto-sort
+        run: gh workflow run auto-sort-stars.yml --repo AnxForever/AnxForever
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
